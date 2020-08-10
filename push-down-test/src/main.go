@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -22,8 +23,14 @@ import (
 const testCaseDir = "./sql"
 const testPrepDir = "./prepare"
 
-var connStrNoPush *string
-var connStrPushWithBatch *string
+type storageType int
+
+const (
+	storageTiKV storageType = iota
+	storageTiFlash
+)
+
+var tidbConnStr *string
 var outputSuccessQueries *bool
 var dbName *string
 var verboseOutput *bool
@@ -64,6 +71,37 @@ func prepareDB(connString string) {
 	db := mustDBOpen(connString, "")
 	mustDBExec(db, "drop database if exists `"+*dbName+"`;")
 	mustDBExec(db, "create database `"+*dbName+"`;")
+	mustDBClose(db)
+}
+
+func runPrepareSQL(dir string) {
+	var files []string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(info.Name(), ".sql") {
+			return nil
+		}
+		if fileFilter != nil && !fileFilter(path) {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	if err != nil {
+		log.Panicf("Prepare error: %v", err)
+	}
+	db := mustDBOpen(*tidbConnStr, *dbName)
+	for _, f := range files {
+		stmtAsts := readAndParseSQLText(f)
+		for _, stmt := range stmtAsts {
+			_, err := runQuery(db, stmt.Text(), storageTiKV)
+			if err != nil {
+				log.Printf("Prepare error when running %s: %v", f, err)
+			}
+		}
+	}
 	mustDBClose(db)
 }
 
@@ -139,18 +177,18 @@ func runTestCase(testCasePath string) bool {
 	}
 
 	log.Printf("Running...[%s]", testCasePath)
-	noPushDownLogChan := make(chan *statementLog)
-	pushDownWithBatchLogChan := make(chan *statementLog)
-	go runStatements(noPushDownLogChan, *connStrNoPush, statements)
-	go runStatements(pushDownWithBatchLogChan, *connStrPushWithBatch, statements)
-	return diffRunResult(testCasePath, noPushDownLogChan, pushDownWithBatchLogChan)
+	pushDownTiKV := make(chan *statementLog)
+	pushDownTiFlash := make(chan *statementLog)
+	go runStatements(pushDownTiKV, *tidbConnStr, statements, storageTiKV)
+	go runStatements(pushDownTiFlash, *tidbConnStr, statements, storageTiFlash)
+	return diffRunResult(testCasePath, pushDownTiKV, pushDownTiFlash)
 }
 
-func runStatements(logChan chan *statementLog, connString string, statements []string) {
+func runStatements(logChan chan *statementLog, connString string, statements []string, storageTp storageType) {
 	db := mustDBOpen(connString, *dbName)
 	connID := getConnectionID(db)
 	for i, stmt := range statements {
-		runSingleStatement(stmt, i, db, connID, logChan)
+		runSingleStatement(stmt, i, db, connID, logChan, storageTp)
 	}
 	mustDBClose(db)
 	close(logChan)
@@ -163,7 +201,27 @@ func getConnectionID(db *sql.DB) int {
 	return v
 }
 
-func runQuery(db *sql.DB, sql string) (string, error) {
+func runQuery(db *sql.DB, sql string, storageTp storageType) (string, error) {
+	// Only test `SELECT` on TiFlash
+	if !strings.HasPrefix(sql, "SELECT") {
+		createTableRE := regexp.MustCompile("^CREATE TABLE\\s+`(\\w+)`\\s+")
+		// sql = strings.ReplaceAll(sql, "\n", "")
+		if m := createTableRE.FindStringSubmatch(sql); m != nil {
+			if *verboseOutput {
+				log.Printf("Add tiflash replica for table %s", m[1])
+			}
+			sql = sql + ("ALTER TABLE `" + m[1] + "` SET TIFLASH REPLICA 1;")
+		} else {
+			sql = "set @@session.tidb_isolation_read_engines='tikv,tiflash';" + sql
+		}
+	} else {
+		switch storageTp {
+		case storageTiKV:
+			sql = "set @@session.tidb_isolation_read_engines='tikv';" + sql
+		case storageTiFlash:
+			sql = "set @@session.tidb_isolation_read_engines='tiflash';" + sql
+		}
+	}
 	rows, err := db.Query(sql)
 	buf := new(bytes.Buffer)
 	if err != nil {
@@ -189,15 +247,15 @@ func runQuery(db *sql.DB, sql string) (string, error) {
 	return buf.String(), nil
 }
 
-func runSingleStatement(stmt string, stmtIndex int, db *sql.DB, connID int, logChan chan *statementLog) bool {
+func runSingleStatement(stmt string, stmtIndex int, db *sql.DB, connID int, logChan chan *statementLog, storageTp storageType) bool {
 	hasError := false
-	output, err := runQuery(db, stmt)
+	output, err := runQuery(db, stmt, storageTp)
 	if err != nil {
 		hasError = true
 		output = err.Error() + "\n"
 	}
 
-	plan, err := runQuery(db, fmt.Sprintf("explain for connection %d;", connID))
+	plan, err := runQuery(db, fmt.Sprintf("explain for connection %d;", connID), storageTp)
 	if err != nil {
 		plan = fmt.Sprintf("Failed to get plan: %s", err.Error())
 	}
@@ -214,8 +272,8 @@ func runSingleStatement(stmt string, stmtIndex int, db *sql.DB, connID int, logC
 
 func diffRunResult(
 	testCasePath string,
-	noPushDownLogChan chan *statementLog,
-	pushDownWithBatchLogChan chan *statementLog,
+	pushDownTiKVLogChan chan *statementLog,
+	pushDownTiFlashLogChan chan *statementLog,
 ) bool {
 	execOkStatements := 0
 	execFailStatements := 0
@@ -226,30 +284,30 @@ func diffRunResult(
 	logger := log.New(output, "", log.LstdFlags)
 
 	for {
-		noPushDownLog, ok1 := <-noPushDownLogChan
-		pushDownWithBatchLog, ok3 := <-pushDownWithBatchLogChan
+		pushDownTiKVLog, ok1 := <-pushDownTiKVLogChan
+		pushDownTiFlashLog, ok3 := <-pushDownTiFlashLogChan
 
 		allEnd := !(ok1 || ok3)
 		if allEnd {
 			break
 		}
 		if !ok1 {
-			logger.Panicf("Internal error: NoPushDown channel drained\n")
+			logger.Panicf("Internal error: pushDownTiKV channel drained\n")
 		}
 		if !ok3 {
-			logger.Panicf("Internal error: WithPushDown channel drained\n")
+			logger.Panicf("Internal error: pushDownTiFlash channel drained\n")
 		}
-		if noPushDownLog.stmt != pushDownWithBatchLog.stmt {
+		if pushDownTiKVLog.stmt != pushDownTiFlashLog.stmt {
 			logger.Panicln("Internal error: Pre-check failed, stmt should be identical",
-				noPushDownLog.stmt, pushDownWithBatchLog.stmt)
+				pushDownTiKVLog.stmt, pushDownTiFlashLog.stmt)
 		}
-		if noPushDownLog.stmtIndex != pushDownWithBatchLog.stmtIndex {
+		if pushDownTiKVLog.stmtIndex != pushDownTiFlashLog.stmtIndex {
 			logger.Panicln("Internal error: Pre-check failed, stmtIndex should be identical",
-				noPushDownLog.stmtIndex, pushDownWithBatchLog.stmtIndex)
+				pushDownTiKVLog.stmtIndex, pushDownTiFlashLog.stmtIndex)
 		}
 
 		hasError := false
-		if noPushDownLog.hasError || pushDownWithBatchLog.hasError {
+		if pushDownTiKVLog.hasError || pushDownTiFlashLog.hasError {
 			execFailStatements++
 			hasError = true
 		} else {
@@ -259,12 +317,12 @@ func diffRunResult(
 		diffFail := false
 		if hasError {
 			// If there are errors, currently we don't check content and only check existence
-			if !noPushDownLog.hasError || !pushDownWithBatchLog.hasError {
+			if !pushDownTiKVLog.hasError || !pushDownTiFlashLog.hasError {
 				diffFail = true
 			}
 		} else {
 			// If there are no error, check content
-			if noPushDownLog.output != pushDownWithBatchLog.output {
+			if pushDownTiKVLog.output != pushDownTiFlashLog.output {
 				diffFail = true
 			}
 		}
@@ -274,37 +332,37 @@ func diffRunResult(
 			logger.Printf("Test fail: Outputs are not matching.\n"+
 				"Test case: %s\n"+
 				"Statement: #%d - %s\n"+
-				"NoPushDown Output: \n%s\n"+
-				"WithPushDown Output: \n%s\n\n"+
-				"NoPushDown Plan: \n%s\n"+
-				"WithPushDown Plan: \n%s\n\n",
+				"TiKV Output: \n%s\n"+
+				"TiFlash Output: \n%s\n\n"+
+				"TiKV Plan: \n%s\n"+
+				"TiFlash Plan: \n%s\n\n",
 				testCasePath,
-				noPushDownLog.stmtIndex,
-				noPushDownLog.stmt,
-				noPushDownLog.output,
-				pushDownWithBatchLog.output,
-				noPushDownLog.plan,
-				pushDownWithBatchLog.plan)
+				pushDownTiKVLog.stmtIndex,
+				pushDownTiKVLog.stmt,
+				pushDownTiKVLog.output,
+				pushDownTiFlashLog.output,
+				pushDownTiKVLog.plan,
+				pushDownTiFlashLog.plan)
 		} else if hasError {
 			if *verboseOutput {
 				logger.Printf("Warn: Execute fail, diff skipped.\n"+
 					"Test case: %s\n"+
 					"Statement: #%d - %s\n"+
-					"NoPushDown Output: \n%s\n"+
-					"WithPushDown Output: \n%s\n\n",
+					"TiKV Output: \n%s\n"+
+					"TiFlash Output: \n%s\n\n",
 					testCasePath,
-					noPushDownLog.stmtIndex,
-					noPushDownLog.stmt,
-					noPushDownLog.output,
-					pushDownWithBatchLog.output)
+					pushDownTiKVLog.stmtIndex,
+					pushDownTiKVLog.stmt,
+					pushDownTiKVLog.output,
+					pushDownTiFlashLog.output)
 			}
 		} else {
 			if *verboseOutput {
 				// Output is same and there is no errors
-				logger.Printf("Info: SQL result is idential: \n%s\n", noPushDownLog.stmt)
+				logger.Printf("Info: SQL result is identical: \n%s\n", pushDownTiKVLog.stmt)
 			}
 
-			successQueries.WriteString(noPushDownLog.stmt)
+			successQueries.WriteString(pushDownTiKVLog.stmt)
 			successQueries.WriteByte('\n')
 		}
 	}
@@ -337,12 +395,13 @@ func diffRunResult(
 }
 
 func buildDefaultConnStr(port int) string {
-	return fmt.Sprintf("root@tcp(localhost:%d)/{db}?allowNativePasswords=true", port)
+	return fmt.Sprintf("root@tcp(localhost:%d)/{db}?allowNativePasswords=true&multiStatements=true", port)
 }
 
 func main() {
-	connStrNoPush = flag.String("conn-no-push", buildDefaultConnStr(4005), "The connection string to connect to a NoPushDown TiDB instance")
-	connStrPushWithBatch = flag.String("conn-push-down", buildDefaultConnStr(4007), "The connection string to connect to a WithPushDown TiDB instance")
+	// connStrNoPush = flag.String("conn-no-push", buildDefaultConnStr(4005), "The connection string to connect to a NoPushDown TiDB instance")
+	// connStrPushWithBatch = flag.String("conn-push-down", buildDefaultConnStr(4007), "The connection string to connect to a WithPushDown TiDB instance")
+	tidbConnStr = flag.String("tidb-service", buildDefaultConnStr(8000), "The connection string to connect to a TiDB instance.")
 	outputSuccessQueries = flag.Bool("output-success", false, "Output success queries of test cases to a file ends with '.success' along with the original test case")
 	dbName = flag.String("db", "push_down_test_db", "The database name to run test cases")
 	verboseOutput = flag.Bool("verbose", false, "Verbose output")
@@ -351,11 +410,11 @@ func main() {
 
 	flag.Parse()
 
-	prepareDB(*connStrNoPush)
-	prepareDB(*connStrPushWithBatch)
+	prepareDB(*tidbConnStr)
 
 	// Prepare SQL does not apply the filter
-	iterateTestCases(testPrepDir, false)
+	// iterateTestCases(testPrepDir, false)
+	runPrepareSQL(testPrepDir)
 
 	log.SetOutput(os.Stdout)
 	log.Printf("Prepare finished, start testing...")
