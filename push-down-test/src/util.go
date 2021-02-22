@@ -3,12 +3,17 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"fmt"
 	"io/ioutil"
 	"log"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/pingcap/errors"
 )
+
+var _ sort.Interface = (*ByteRows)(nil)
 
 type ByteRow struct {
 	Data [][]byte
@@ -132,4 +137,47 @@ func mustDBExec(db *sql.DB, query string) {
 	if err != nil {
 		log.Panicf("Failed to execute query [%s]: %v\n", query, err)
 	}
+}
+
+func waitTiFlashReplica(table string, db *sql.DB) error {
+	query := fmt.Sprintf(
+		`select available from information_schema.tiflash_replica where table_schema = '%s' and table_name = '%s'`,
+		*dbName, table)
+
+	start := time.Now()
+	for {
+		if time.Since(start) > time.Second*30 {
+			return fmt.Errorf("Wait TiFlash replica %s.%s for too long", *dbName, table)
+		}
+		available, err := func() (ok bool, err error) {
+			rows, err := db.Query(query)
+			if err != nil {
+				return
+			}
+			defer rows.Close()
+			cols, err := rows.Columns()
+			if err != nil {
+				return
+			}
+			br, err := SqlRowsToByteRows(rows, cols)
+			if err != nil {
+				return
+			}
+			if br.Len() != 1 {
+				err = fmt.Errorf("Invalid TiFlash replica: %s.%s", *dbName, table)
+				return
+			}
+			if v := br.Data[0].Data[0]; string(v) == "1" {
+				return true, nil
+			}
+			return
+		}()
+		if err != nil {
+			return err
+		}
+		if available {
+			break
+		}
+	}
+	return nil
 }
