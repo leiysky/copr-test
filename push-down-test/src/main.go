@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -202,8 +204,9 @@ func getConnectionID(db *sql.DB) int {
 }
 
 func runQuery(db *sql.DB, sql string, storageTp storageType) (string, error) {
+
 	// Only test `SELECT` on TiFlash
-	if !strings.HasPrefix(sql, "SELECT") {
+	if !strings.HasPrefix(sql, " SELECT") {
 		createTableRE := regexp.MustCompile("^CREATE TABLE\\s+`(\\w+)`\\s+")
 		// sql = strings.ReplaceAll(sql, "\n", "")
 		if m := createTableRE.FindStringSubmatch(sql); m != nil {
@@ -211,22 +214,36 @@ func runQuery(db *sql.DB, sql string, storageTp storageType) (string, error) {
 				log.Printf("Add tiflash replica for table %s", m[1])
 			}
 			sql = sql + ("ALTER TABLE `" + m[1] + "` SET TIFLASH REPLICA 1;")
-		} else {
-			sql = "set @@session.tidb_isolation_read_engines='tikv,tiflash';" + sql
+			mustDBExec(db, sql)
+			err := waitTiFlashReplica(m[1], db)
+			if err != nil {
+				return "", err
+			}
+			return "", nil
 		}
-	} else {
-		switch storageTp {
-		case storageTiKV:
-			sql = "set @@session.tidb_isolation_read_engines='tikv';" + sql
-		case storageTiFlash:
-			sql = "set @@session.tidb_isolation_read_engines='tiflash';" + sql
-		}
+		mustDBExec(db, sql)
+		return "", nil
 	}
-	rows, err := db.Query(sql)
-	buf := new(bytes.Buffer)
+	switch storageTp {
+	case storageTiKV:
+		sql = "set session tidb_isolation_read_engines='tikv';" + sql
+	case storageTiFlash:
+		sql = "set session tidb_isolation_read_engines='tiflash';" + sql
+	}
+	// if *verboseOutput {
+	// 	log.Printf("Executing SQL: %s", sql)
+	// }
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return "", err
 	}
+	defer conn.Close()
+	rows, err := conn.QueryContext(ctx, sql)
+	if err != nil {
+		return "", err
+	}
+	buf := new(bytes.Buffer)
 	defer func() {
 		expectNoErr(rows.Close())
 	}()
@@ -240,6 +257,7 @@ func runQuery(db *sql.DB, sql string, storageTp storageType) (string, error) {
 		if sqlErr != nil {
 			return "", sqlErr
 		}
+		sort.Sort(byteRows)
 		WriteQueryResult(byteRows, buf)
 	}
 	buf.WriteString("\n")
@@ -401,7 +419,7 @@ func buildDefaultConnStr(port int) string {
 func main() {
 	// connStrNoPush = flag.String("conn-no-push", buildDefaultConnStr(4005), "The connection string to connect to a NoPushDown TiDB instance")
 	// connStrPushWithBatch = flag.String("conn-push-down", buildDefaultConnStr(4007), "The connection string to connect to a WithPushDown TiDB instance")
-	tidbConnStr = flag.String("tidb-service", buildDefaultConnStr(8000), "The connection string to connect to a TiDB instance.")
+	tidbConnStr = flag.String("tidb-service", buildDefaultConnStr(28137), "The connection string to connect to a TiDB instance.")
 	outputSuccessQueries = flag.Bool("output-success", false, "Output success queries of test cases to a file ends with '.success' along with the original test case")
 	dbName = flag.String("db", "push_down_test_db", "The database name to run test cases")
 	verboseOutput = flag.Bool("verbose", false, "Verbose output")
