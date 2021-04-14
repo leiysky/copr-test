@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -233,13 +232,7 @@ func runQuery(db *sql.DB, sql string, storageTp storageType) (string, error) {
 	// if *verboseOutput {
 	// 	log.Printf("Executing SQL: %s", sql)
 	// }
-	ctx := context.Background()
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-	rows, err := conn.QueryContext(ctx, sql)
+	rows, err := db.Query(sql)
 	if err != nil {
 		return "", err
 	}
@@ -412,14 +405,13 @@ func diffRunResult(
 	return diffFailStatements == 0
 }
 
-func buildDefaultConnStr(port int) string {
+func buildDefaultConnStr(host string, port int) string {
 	return fmt.Sprintf("root@tcp(localhost:%d)/{db}?allowNativePasswords=true&multiStatements=true", port)
 }
 
 func main() {
-	// connStrNoPush = flag.String("conn-no-push", buildDefaultConnStr(4005), "The connection string to connect to a NoPushDown TiDB instance")
-	// connStrPushWithBatch = flag.String("conn-push-down", buildDefaultConnStr(4007), "The connection string to connect to a WithPushDown TiDB instance")
-	tidbConnStr = flag.String("tidb-service", buildDefaultConnStr(28137), "The connection string to connect to a TiDB instance.")
+	tidbHost := flag.String("host", "localhost", "TiDB service host")
+	tidbPort := flag.Int("port", 8000, "TiDB service port")
 	outputSuccessQueries = flag.Bool("output-success", false, "Output success queries of test cases to a file ends with '.success' along with the original test case")
 	dbName = flag.String("db", "push_down_test_db", "The database name to run test cases")
 	verboseOutput = flag.Bool("verbose", false, "Verbose output")
@@ -428,6 +420,7 @@ func main() {
 
 	flag.Parse()
 
+	*tidbConnStr = buildDefaultConnStr(*tidbHost, *tidbPort)
 	prepareDB(*tidbConnStr)
 
 	// Prepare SQL does not apply the filter
