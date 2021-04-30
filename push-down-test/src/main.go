@@ -21,8 +21,8 @@ import (
 	_ "github.com/pingcap/tidb/types/parser_driver"
 )
 
-const testCaseDir = "./sql"
-const testPrepDir = "./prepare"
+var testCaseDir *string
+var testPrepDir *string
 
 type storageType int
 
@@ -31,7 +31,8 @@ const (
 	storageTiFlash
 )
 
-var tidbConnStr *string
+var tidbConnStr string
+
 var outputSuccessQueries *bool
 var dbName *string
 var verboseOutput *bool
@@ -93,7 +94,7 @@ func runPrepareSQL(dir string) {
 	if err != nil {
 		log.Panicf("Prepare error: %v", err)
 	}
-	db := mustDBOpen(*tidbConnStr, *dbName)
+	db := mustDBOpen(tidbConnStr, *dbName)
 	for _, f := range files {
 		stmtAsts := readAndParseSQLText(f)
 		for _, stmt := range stmtAsts {
@@ -180,8 +181,8 @@ func runTestCase(testCasePath string) bool {
 	log.Printf("Running...[%s]", testCasePath)
 	pushDownTiKV := make(chan *statementLog)
 	pushDownTiFlash := make(chan *statementLog)
-	go runStatements(pushDownTiKV, *tidbConnStr, statements, storageTiKV)
-	go runStatements(pushDownTiFlash, *tidbConnStr, statements, storageTiFlash)
+	go runStatements(pushDownTiKV, tidbConnStr, statements, storageTiKV)
+	go runStatements(pushDownTiFlash, tidbConnStr, statements, storageTiFlash)
 	return diffRunResult(testCasePath, pushDownTiKV, pushDownTiFlash)
 }
 
@@ -205,7 +206,7 @@ func getConnectionID(db *sql.DB) int {
 func runQuery(db *sql.DB, sql string, storageTp storageType) (string, error) {
 
 	// Only test `SELECT` on TiFlash
-	if !strings.HasPrefix(sql, " SELECT") {
+	if !strings.HasPrefix(strings.TrimSpace(sql), "SELECT") {
 		createTableRE := regexp.MustCompile("^CREATE TABLE\\s+`(\\w+)`\\s+")
 		// sql = strings.ReplaceAll(sql, "\n", "")
 		if m := createTableRE.FindStringSubmatch(sql); m != nil {
@@ -406,12 +407,15 @@ func diffRunResult(
 }
 
 func buildDefaultConnStr(host string, port int) string {
-	return fmt.Sprintf("root@tcp(localhost:%d)/{db}?allowNativePasswords=true&multiStatements=true", port)
+	return fmt.Sprintf("root@tcp(%s:%d)/{db}?allowNativePasswords=true&multiStatements=true", host, port)
 }
 
 func main() {
 	tidbHost := flag.String("host", "localhost", "TiDB service host")
 	tidbPort := flag.Int("port", 8000, "TiDB service port")
+	testCaseDir = flag.String("test_case_dir", "./sql", "copr-test test case directory")
+	testPrepDir = flag.String("prepare_dir", "./prepare", "copr-test prepare sql directory")
+
 	outputSuccessQueries = flag.Bool("output-success", false, "Output success queries of test cases to a file ends with '.success' along with the original test case")
 	dbName = flag.String("db", "push_down_test_db", "The database name to run test cases")
 	verboseOutput = flag.Bool("verbose", false, "Verbose output")
@@ -420,12 +424,12 @@ func main() {
 
 	flag.Parse()
 
-	*tidbConnStr = buildDefaultConnStr(*tidbHost, *tidbPort)
-	prepareDB(*tidbConnStr)
+	tidbConnStr = buildDefaultConnStr(*tidbHost, *tidbPort)
+	prepareDB(tidbConnStr)
 
 	// Prepare SQL does not apply the filter
 	// iterateTestCases(testPrepDir, false)
-	runPrepareSQL(testPrepDir)
+	runPrepareSQL(*testPrepDir)
 
 	log.SetOutput(os.Stdout)
 	log.Printf("Prepare finished, start testing...")
@@ -460,5 +464,5 @@ func main() {
 
 		return false
 	}
-	iterateTestCases(testCaseDir, true)
+	iterateTestCases(*testCaseDir, true)
 }
