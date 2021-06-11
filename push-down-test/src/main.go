@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/pingcap/parser"
@@ -20,6 +21,8 @@ import (
 	"github.com/pingcap/parser/mysql"
 	_ "github.com/pingcap/tidb/types/parser_driver"
 )
+
+var exitCode int32 = 0
 
 var testCaseDir *string
 var testPrepDir *string
@@ -126,7 +129,7 @@ func iterateTestCases(dir string, parallel bool) {
 		return nil
 	})
 	if err != nil {
-		log.Panicf("Failed to read test case directory [%s]: %v\n", testCaseDir, err)
+		log.Panicf("Failed to read test case directory [%s]: %v\n", *testCaseDir, err)
 	}
 
 	if !parallel {
@@ -166,7 +169,8 @@ func iterateTestCases(dir string, parallel bool) {
 
 	log.Printf("All test finished: pass cases: %d, fail cases: %d", successCases, failedCases)
 	if failedCases > 0 {
-		os.Exit(2) // Diff fail results in exit code 2 to distinguish with panic
+		// os.Exit(2) // Diff fail results in exit code 2 to distinguish with panic
+		atomic.StoreInt32(&exitCode, 2)
 	}
 }
 
@@ -204,6 +208,32 @@ func getConnectionID(db *sql.DB) int {
 }
 
 func runQuery(db *sql.DB, sql string, storageTp storageType) (string, error) {
+	if strings.HasPrefix(sql, "explain for connection") {
+		rows, err := db.Query(sql)
+		if err != nil {
+			return "", err
+		}
+		buf := new(bytes.Buffer)
+		defer func() {
+			expectNoErr(rows.Close())
+		}()
+		cols, err := rows.Columns()
+		expectNoErr(err)
+		if len(cols) > 0 {
+			byteRows, err := SqlRowsToByteRows(rows, cols)
+			expectNoErr(err)
+
+			sqlErr := rows.Err()
+			if sqlErr != nil {
+				return "", sqlErr
+			}
+			sort.Sort(byteRows)
+			WriteQueryResult(byteRows, buf)
+		}
+		buf.WriteString("\n")
+
+		return buf.String(), nil
+	}
 
 	// Only test `SELECT` on TiFlash
 	if !strings.HasPrefix(strings.TrimSpace(sql), "SELECT") {
@@ -394,7 +424,8 @@ func diffRunResult(
 	log.Println(output.String())
 
 	if diffFailStatements > 0 {
-		os.Exit(2)
+		// os.Exit(2)
+		atomic.StoreInt32(&exitCode, 2)
 	}
 
 	if *outputSuccessQueries {
@@ -465,4 +496,5 @@ func main() {
 		return false
 	}
 	iterateTestCases(*testCaseDir, true)
+	os.Exit(int(exitCode))
 }

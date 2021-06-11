@@ -146,7 +146,7 @@ func waitTiFlashReplica(table string, db *sql.DB) error {
 
 	start := time.Now()
 	for {
-		if time.Since(start) > time.Second*30 {
+		if time.Since(start) > time.Second*300 {
 			return fmt.Errorf("Wait TiFlash replica %s.%s for too long", *dbName, table)
 		}
 		available, err := func() (ok bool, err error) {
